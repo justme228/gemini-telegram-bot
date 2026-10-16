@@ -16,8 +16,14 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 user_sessions = {}
 bot_username = None
 
-# Cost-optimized config: Live Google Search ONLY (Zero thinking tokens)
+# Ultra-compact, cost-efficient configuration
 CHAT_CONFIG = types.GenerateContentConfig(
+    system_instruction=(
+        "You are an ultra-compact Telegram assistant. "
+        "Keep all answers as short, concise, and dense as possible without losing any essential facts. "
+        "No conversational filler, pleasantries, or preamble. "
+        "Do NOT provide sources, citations, or URLs unless the user explicitly asks for them."
+    ),
     tools=[types.Tool(google_search=types.GoogleSearch())],
 )
 
@@ -83,9 +89,7 @@ async def telegram_webhook(request: Request):
     user_sessions[chat_id] = client.chats.create(
         model=MODEL_NAME, config=CHAT_CONFIG
     )
-    reply_text = (
-        f"Context reset! Connected to {MODEL_NAME} with live Web Search."
-    )
+    reply_text = f"Context reset! Ready ({MODEL_NAME})."
   else:
     if chat_id not in user_sessions:
       user_sessions[chat_id] = client.chats.create(
@@ -95,36 +99,26 @@ async def telegram_webhook(request: Request):
     chat = user_sessions[chat_id]
     try:
       response = chat.send_message(clean_prompt)
-      reply_text = response.text or "No response generated."
-
-      # Append source citations if Google Search was triggered
-      if response.candidates and response.candidates[0].grounding_metadata:
-        metadata = response.candidates[0].grounding_metadata
-        if metadata.grounding_chunks:
-          sources = []
-          for chunk in metadata.grounding_chunks[:3]:
-            if chunk.web and chunk.web.uri:
-              title = chunk.web.title or "Source"
-              sources.append(f"• [{title}]({chunk.web.uri})")
-          if sources:
-            reply_text += "\n\n🌐 **Sources:**\n" + "\n".join(sources)
-
+      reply_text = response.text or "No response."
     except Exception as e:
       reply_text = f"Gemini Error: {e}"
 
-  # Keep within Telegram's 4096 character limit
+  # Keep within Telegram's limit
   if len(reply_text) > 4000:
-    reply_text = reply_text[:4000] + "... [truncated]"
+    reply_text = reply_text[:4000] + "..."
 
+  # Send response (with fallback if markdown formatting has issues)
   async with httpx.AsyncClient(timeout=60.0) as http_client:
-    await http_client.post(
-        f"{TELEGRAM_API_URL}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": reply_text,
-            "reply_to_message_id": message["message_id"],
-            "parse_mode": "Markdown",
-        },
-    )
+    payload = {
+        "chat_id": chat_id,
+        "text": reply_text,
+        "reply_to_message_id": message["message_id"],
+        "parse_mode": "Markdown",
+    }
+    res = await http_client.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
+    if res.status_code != 200:
+      # Retry without markdown formatting if Telegram rejected special characters
+      payload.pop("parse_mode")
+      await http_client.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
 
   return {"status": "ok"}
