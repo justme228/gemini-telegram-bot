@@ -1,3 +1,4 @@
+import html
 import os
 import re
 import httpx
@@ -16,16 +17,40 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 user_sessions = {}
 bot_username = None
 
-# Ultra-compact, cost-efficient configuration
+# Tell Gemini to avoid markdown headers and keep it compact
 CHAT_CONFIG = types.GenerateContentConfig(
     system_instruction=(
         "You are an ultra-compact Telegram assistant. "
-        "Keep all answers as short, concise, and dense as possible without losing any essential facts. "
-        "No conversational filler, pleasantries, or preamble. "
-        "Do NOT provide sources, citations, or URLs unless the user explicitly asks for them."
+        "Keep answers short, concise, and dense without losing essential facts. "
+        "Do NOT use markdown headers like ### or ## (use bold text instead). "
+        "Do NOT provide sources, citations, or URLs unless explicitly asked."
     ),
     tools=[types.Tool(google_search=types.GoogleSearch())],
 )
+
+
+def format_for_telegram(text: str) -> str:
+  """Converts Gemini's standard markdown into Telegram-safe HTML."""
+  # 1. Escape HTML special characters
+  text = html.escape(text, quote=False)
+
+  # 2. Convert markdown headers (### Header) to bold
+  text = re.sub(r"^(?:#{1,6})\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+  # 3. Convert **bold** to <b>bold</b>
+  text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+  # 4. Convert *italic* or _italic_ to <i>italic</i>
+  text = re.sub(r"(?<!\n)\*(.+?)\*", r"<i>\1</i>", text)
+  text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
+
+  # 5. Convert `code` to <code>code</code>
+  text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+
+  # 6. Convert bullet asterisks (* item) into clean bullet points (• item)
+  text = re.sub(r"^\*\s+", r"• ", text, flags=re.MULTILINE)
+
+  return text
 
 
 async def get_bot_username():
@@ -99,26 +124,28 @@ async def telegram_webhook(request: Request):
     chat = user_sessions[chat_id]
     try:
       response = chat.send_message(clean_prompt)
-      reply_text = response.text or "No response."
+      raw_text = response.text or "No response."
+      reply_text = format_for_telegram(raw_text)
     except Exception as e:
       reply_text = f"Gemini Error: {e}"
 
-  # Keep within Telegram's limit
+  # Keep within Telegram limit
   if len(reply_text) > 4000:
     reply_text = reply_text[:4000] + "..."
 
-  # Send response (with fallback if markdown formatting has issues)
+  # Send response via HTML mode
   async with httpx.AsyncClient(timeout=60.0) as http_client:
     payload = {
         "chat_id": chat_id,
         "text": reply_text,
         "reply_to_message_id": message["message_id"],
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }
     res = await http_client.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
     if res.status_code != 200:
-      # Retry without markdown formatting if Telegram rejected special characters
+      # If Telegram HTML parsing still complains, fallback to clean plain text
       payload.pop("parse_mode")
+      payload["text"] = re.sub(r"<[^>]+>", "", reply_text)
       await http_client.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
 
   return {"status": "ok"}
