@@ -22,7 +22,7 @@ CHAT_CONFIG = types.GenerateContentConfig(
     system_instruction=(
         "You are an ultra-compact Telegram assistant. "
         "Keep answers short, concise, and dense without losing essential facts. "
-        "Do NOT use markdown headers like ### or ## (use bold text instead). "
+        "Do NOT use markdown headers like ### or ## (use bold text instead). Keep the standard format for Telegram messages "
         "Do NOT provide sources, citations, or URLs unless explicitly asked."
     ),
     tools=[types.Tool(google_search=types.GoogleSearch())],
