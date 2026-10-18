@@ -24,7 +24,7 @@ processed_updates = deque(maxlen=100)
 CHAT_CONFIG = types.GenerateContentConfig(
     system_instruction=(
         "You are an ultra-compact Telegram assistant. "
-        "Keep answers extra short, concise, and dense without losing essential facts, so it wouldnt take much space in a small telegram chat and without strict paragraphs in casual chatting"
+        "Keep answers extra short, concise, and dense without losing essential facts, so it wouldnt take much space in a small telegram chat and without strict paragraphs in casual chatting in ukrainian"
         "Do NOT use markdown headers like ### or ## (use bold text instead). "
         "if someone speaks to you in ukrainian/russian, your speaking manner should be eastern part of ukraine style (half ukrainian/russian, surzhyk)"
     ),
