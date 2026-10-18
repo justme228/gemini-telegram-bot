@@ -1,10 +1,11 @@
+from collections import deque
 import html
 import os
 import re
-import httpx
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from google import genai
 from google.genai import types
+import httpx
 
 app = FastAPI()
 
@@ -17,12 +18,14 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 user_sessions = {}
 bot_username = None
 
-# Tell Gemini to avoid markdown headers and keep it compact
+# Store the last 100 update_ids to prevent duplicate replies
+processed_updates = deque(maxlen=100)
+
 CHAT_CONFIG = types.GenerateContentConfig(
     system_instruction=(
         "You are an ultra-compact Telegram assistant. "
         "Keep answers short, concise, and dense without losing essential facts. "
-        "Do NOT use markdown headers like ### or ## (use bold text instead). Keep the best practice exclusively for Telegram messages "
+        "Do NOT use markdown headers like ### or ## (use bold text instead). "
         "Do NOT provide sources, citations, or URLs unless explicitly asked."
     ),
     tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -31,25 +34,13 @@ CHAT_CONFIG = types.GenerateContentConfig(
 
 def format_for_telegram(text: str) -> str:
   """Converts Gemini's standard markdown into Telegram-safe HTML."""
-  # 1. Escape HTML special characters
   text = html.escape(text, quote=False)
-
-  # 2. Convert markdown headers (### Header) to bold
   text = re.sub(r"^(?:#{1,6})\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-
-  # 3. Convert **bold** to <b>bold</b>
   text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-
-  # 4. Convert *italic* or _italic_ to <i>italic</i>
   text = re.sub(r"(?<!\n)\*(.+?)\*", r"<i>\1</i>", text)
   text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
-
-  # 5. Convert `code` to <code>code</code>
   text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-
-  # 6. Convert bullet asterisks (* item) into clean bullet points (• item)
   text = re.sub(r"^\*\s+", r"• ", text, flags=re.MULTILINE)
-
   return text
 
 
@@ -63,19 +54,8 @@ async def get_bot_username():
   return bot_username
 
 
-@app.get("/")
-def health_check():
-  return {"status": "ok", "model": MODEL_NAME}
-
-
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-  data = await request.json()
-  message = data.get("message")
-
-  if not message or "text" not in message:
-    return {"status": "ok"}
-
+async def process_message(message: dict):
+  """Handles the Gemini call and sends the Telegram message in the background."""
   chat_id = message["chat"]["id"]
   chat_type = message["chat"].get("type", "private")
   user_text = message["text"].strip()
@@ -83,7 +63,6 @@ async def telegram_webhook(request: Request):
   my_username = await get_bot_username()
   mention = f"@{my_username}" if my_username else None
 
-  # Check if someone replied to the bot
   reply_to = message.get("reply_to_message")
   is_reply_to_bot = (
       reply_to
@@ -91,15 +70,12 @@ async def telegram_webhook(request: Request):
       and reply_to.get("from", {}).get("username", "").lower() == my_username
   )
 
-  # Check if bot was @tagged
   is_mentioned = mention and (mention in user_text.lower())
 
-  # In groups, only answer when tagged or replied to
   if chat_type in ["group", "supergroup"]:
     if not (is_mentioned or is_reply_to_bot or user_text.startswith("/start")):
-      return {"status": "ignored"}
+      return
 
-  # Strip @mention from prompt
   clean_prompt = user_text
   if mention and mention in clean_prompt.lower():
     clean_prompt = re.sub(
@@ -109,7 +85,6 @@ async def telegram_webhook(request: Request):
   if not clean_prompt and is_mentioned:
     clean_prompt = "Hello!"
 
-  # Reset context command
   if clean_prompt in ["/start", "/clear", "/reset"]:
     user_sessions[chat_id] = client.chats.create(
         model=MODEL_NAME, config=CHAT_CONFIG
@@ -129,11 +104,9 @@ async def telegram_webhook(request: Request):
     except Exception as e:
       reply_text = f"Gemini Error: {e}"
 
-  # Keep within Telegram limit
   if len(reply_text) > 4000:
     reply_text = reply_text[:4000] + "..."
 
-  # Send response via HTML mode
   async with httpx.AsyncClient(timeout=60.0) as http_client:
     payload = {
         "chat_id": chat_id,
@@ -143,9 +116,30 @@ async def telegram_webhook(request: Request):
     }
     res = await http_client.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
     if res.status_code != 200:
-      # If Telegram HTML parsing still complains, fallback to clean plain text
       payload.pop("parse_mode")
       payload["text"] = re.sub(r"<[^>]+>", "", reply_text)
       await http_client.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
+
+
+@app.get("/")
+def health_check():
+  return {"status": "ok", "model": MODEL_NAME}
+
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+  data = await request.json()
+  update_id = data.get("update_id")
+
+  # 1. Ignore duplicate webhook retries from Telegram
+  if update_id is not None:
+    if update_id in processed_updates:
+      return {"status": "duplicate_ignored"}
+    processed_updates.append(update_id)
+
+  message = data.get("message")
+  if message and "text" in message:
+    # 2. Process in background and return 200 OK to Telegram immediately
+    background_tasks.add_task(process_message, message)
 
   return {"status": "ok"}
