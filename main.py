@@ -12,28 +12,26 @@ app = FastAPI()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 user_sessions = {}
 bot_username = None
-
-# Store the last 100 update_ids to prevent duplicate replies
 processed_updates = deque(maxlen=100)
 
 CHAT_CONFIG = types.GenerateContentConfig(
     system_instruction=(
         "You are an ultra-compact Telegram assistant. "
-        "Keep answers extra short, concise, and dense without losing essential facts, so it wouldnt take much space in a small telegram chat and without strict paragraphs in casual chatting in ukrainian"
+        "Keep answers short, concise, and dense without losing essential facts. "
         "Do NOT use markdown headers like ### or ## (use bold text instead). "
-        "if someone speaks to you in ukrainian/russian, your speaking manner should be eastern part of ukraine style (half ukrainian/russian, surzhyk)"
+        "Do NOT provide sources, citations, or URLs unless explicitly asked."
     ),
     tools=[types.Tool(google_search=types.GoogleSearch())],
 )
 
 
 def format_for_telegram(text: str) -> str:
-  """Converts Gemini's standard markdown into Telegram-safe HTML."""
   text = html.escape(text, quote=False)
   text = re.sub(r"^(?:#{1,6})\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
   text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
@@ -55,10 +53,29 @@ async def get_bot_username():
 
 
 async def process_message(message: dict):
-  """Handles the Gemini call and sends the Telegram message in the background."""
   chat_id = message["chat"]["id"]
-  chat_type = message["chat"].get("type", "private")
-  user_text = message["text"].strip()
+  # In Telegram, photos use 'caption' instead of 'text'
+  user_text = (message.get("text") or message.get("caption") or "").strip()
+  has_photo = bool(message.get("photo"))
+
+  # Helper command to find out your group's Chat ID
+  if user_text.startswith("/chatid") and (
+      not ALLOWED_CHAT_ID or str(chat_id) == str(ALLOWED_CHAT_ID).strip()
+  ):
+    async with httpx.AsyncClient() as http_client:
+      await http_client.post(
+          f"{TELEGRAM_API_URL}/sendMessage",
+          json={
+              "chat_id": chat_id,
+              "text": f"This chat's ID is: <code>{chat_id}</code>",
+              "parse_mode": "HTML",
+          },
+      )
+    return
+
+  # STRICT LOCK: Ignore all other chats/DMs if ALLOWED_CHAT_ID is set
+  if ALLOWED_CHAT_ID and str(chat_id) != str(ALLOWED_CHAT_ID).strip():
+    return
 
   my_username = await get_bot_username()
   mention = f"@{my_username}" if my_username else None
@@ -72,9 +89,9 @@ async def process_message(message: dict):
 
   is_mentioned = mention and (mention in user_text.lower())
 
-  if chat_type in ["group", "supergroup"]:
-    if not (is_mentioned or is_reply_to_bot or user_text.startswith("/start")):
-      return
+  # Only answer when tagged, replied to, or given /start
+  if not (is_mentioned or is_reply_to_bot or user_text.startswith("/start")):
+    return
 
   clean_prompt = user_text
   if mention and mention in clean_prompt.lower():
@@ -82,9 +99,14 @@ async def process_message(message: dict):
         re.escape(mention), "", clean_prompt, flags=re.IGNORECASE
     ).strip()
 
-  if not clean_prompt and is_mentioned:
-    clean_prompt = "Hello!"
+  # Fallback prompts if message text is empty
+  if not clean_prompt:
+    if has_photo:
+      clean_prompt = "Analyze and describe what you see in this image."
+    elif is_mentioned:
+      clean_prompt = "Hello!"
 
+  # Reset context command
   if clean_prompt in ["/start", "/clear", "/reset"]:
     user_sessions[chat_id] = client.chats.create(
         model=MODEL_NAME, config=CHAT_CONFIG
@@ -97,8 +119,43 @@ async def process_message(message: dict):
       )
 
     chat = user_sessions[chat_id]
+    image_part = None
+
+    # Download image from Telegram if a photo is attached
+    if has_photo:
+      try:
+        # photo[-1] is the highest resolution version
+        photo_obj = message["photo"][-1]
+        file_id = photo_obj["file_id"]
+
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+          file_res = await http_client.get(
+              f"{TELEGRAM_API_URL}/getFile?file_id={file_id}"
+          )
+          if file_res.status_code == 200:
+            file_path = file_res.json().get("result", {}).get("file_path")
+            if file_path:
+              dl_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+              img_res = await http_client.get(dl_url)
+              if img_res.status_code == 200:
+                mime = (
+                    "image/png"
+                    if file_path.lower().endswith(".png")
+                    else "image/jpeg"
+                )
+                image_part = types.Part.from_bytes(
+                    data=img_res.content, mime_type=mime
+                )
+      except Exception as img_err:
+        print(f"Error fetching image: {img_err}")
+
+    # Build the payload (image + prompt or just prompt)
+    message_payload = (
+        [image_part, clean_prompt] if image_part else clean_prompt
+    )
+
     try:
-      response = chat.send_message(clean_prompt)
+      response = chat.send_message(message_payload)
       raw_text = response.text or "No response."
       reply_text = format_for_telegram(raw_text)
     except Exception as e:
@@ -131,15 +188,16 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
   data = await request.json()
   update_id = data.get("update_id")
 
-  # 1. Ignore duplicate webhook retries from Telegram
   if update_id is not None:
     if update_id in processed_updates:
       return {"status": "duplicate_ignored"}
     processed_updates.append(update_id)
 
   message = data.get("message")
-  if message and "text" in message:
-    # 2. Process in background and return 200 OK to Telegram immediately
+  # Accept messages containing text or photo
+  if message and (
+      "text" in message or "caption" in message or "photo" in message
+  ):
     background_tasks.add_task(process_message, message)
 
   return {"status": "ok"}
